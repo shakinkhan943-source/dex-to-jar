@@ -1,0 +1,76 @@
+name: Release
+
+# Pushing a `v*` tag is the whole release procedure. The tag is what JitPack resolves as the version,
+# so this workflow only has to prove the tagged commit builds, attach the artifacts, and ask JitPack
+# to start building that tag ahead of the first consumer request.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          # Release notes are generated from the history since the previous tag.
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # A tag that does not build must not become a release consumers can depend on.
+      - name: Build and run the test suite
+        run: ./gradlew build
+
+      - name: Package the command line interface
+        run: |
+          set -euo pipefail
+          ./gradlew :vortex-cli:installDist
+          cd vortex-cli/build/install
+          zip -qr "${GITHUB_WORKSPACE}/vortex-${GITHUB_REF_NAME}-cli.zip" vortex
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mapfile -t files < <(find . -path '*/build/libs/*.jar' | sort)
+          files+=("vortex-${tag}-cli.zip")
+          printf 'attaching:\n%s\n' "${files[@]}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" \
+              --title "vortex-dex ${tag}" \
+              --generate-notes
+          fi
+
+      # JitPack normally builds lazily on the first dependency resolution. Touching the artifact URL
+      # starts that build now so a consumer is not the one waiting for it. Best effort by design: a
+      # JitPack outage must not fail an otherwise good release.
+      - name: Ask JitPack to build the tag
+        continue-on-error: true
+        run: |
+          curl --max-time 30 --silent --show-error --fail --location \
+            "https://jitpack.io/com/github/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/" \
+            --output /dev/null \
+            && echo "JitPack build requested for ${GITHUB_REF_NAME}" \
+            || echo "JitPack did not answer; it will build the tag on first use instead."

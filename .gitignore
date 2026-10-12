@@ -1,0 +1,18 @@
+# Gradle
+.gradle/
+build/
+
+# Kotlin
+.kotlin/
+
+# IDEs
+.idea/
+*.iml
+out/
+
+# build output that is NOT source (committed wrappers / docs only)
+*.jar
+META-INF/
+src/testFixtures/
+# OS noise
+.DS_Store
