@@ -1,3 +1,4 @@
+[![](https://jitpack.io/v/shakinkhan943-source/dex-to-jar.svg)](https://jitpack.io/#shakinkhan943-source/dex-to-jar)
 # vortex-dex
 
 A DEX-to-JVM translation engine. It reads Dalvik bytecode — a raw `classes.dex`, a multi-dex
