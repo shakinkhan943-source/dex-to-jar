@@ -205,21 +205,23 @@ class DexInstructionDecoder(private val resolver: DexReferenceResolver = DexRefe
                 HirArrayLength(address, registers.registerA, registers.registerB)
             }
 
-            Opcode.AGET, Opcode.AGET_WIDE, Opcode.AGET_OBJECT ->
-                decodeArrayLoad(instruction, address, opcode, null)
+            Opcode.AGET -> decodeArrayLoad(instruction, address, opcode, null, wide = false)
+            Opcode.AGET_WIDE -> decodeArrayLoad(instruction, address, opcode, null, wide = true)
+            Opcode.AGET_OBJECT -> decodeArrayLoad(instruction, address, opcode, null, wide = false)
 
-            Opcode.AGET_BOOLEAN -> decodeArrayLoad(instruction, address, opcode, VortexTypes.BOOLEAN)
-            Opcode.AGET_BYTE -> decodeArrayLoad(instruction, address, opcode, VortexTypes.BYTE)
-            Opcode.AGET_CHAR -> decodeArrayLoad(instruction, address, opcode, VortexTypes.CHAR)
-            Opcode.AGET_SHORT -> decodeArrayLoad(instruction, address, opcode, VortexTypes.SHORT)
+            Opcode.AGET_BOOLEAN -> decodeArrayLoad(instruction, address, opcode, VortexTypes.BOOLEAN, wide = false)
+            Opcode.AGET_BYTE -> decodeArrayLoad(instruction, address, opcode, VortexTypes.BYTE, wide = false)
+            Opcode.AGET_CHAR -> decodeArrayLoad(instruction, address, opcode, VortexTypes.CHAR, wide = false)
+            Opcode.AGET_SHORT -> decodeArrayLoad(instruction, address, opcode, VortexTypes.SHORT, wide = false)
 
-            Opcode.APUT, Opcode.APUT_WIDE, Opcode.APUT_OBJECT ->
-                decodeArrayStore(instruction, address, opcode, null)
+            Opcode.APUT -> decodeArrayStore(instruction, address, opcode, null, wide = false)
+            Opcode.APUT_WIDE -> decodeArrayStore(instruction, address, opcode, null, wide = true)
+            Opcode.APUT_OBJECT -> decodeArrayStore(instruction, address, opcode, null, wide = false)
 
-            Opcode.APUT_BOOLEAN -> decodeArrayStore(instruction, address, opcode, VortexTypes.BOOLEAN)
-            Opcode.APUT_BYTE -> decodeArrayStore(instruction, address, opcode, VortexTypes.BYTE)
-            Opcode.APUT_CHAR -> decodeArrayStore(instruction, address, opcode, VortexTypes.CHAR)
-            Opcode.APUT_SHORT -> decodeArrayStore(instruction, address, opcode, VortexTypes.SHORT)
+            Opcode.APUT_BOOLEAN -> decodeArrayStore(instruction, address, opcode, VortexTypes.BOOLEAN, wide = false)
+            Opcode.APUT_BYTE -> decodeArrayStore(instruction, address, opcode, VortexTypes.BYTE, wide = false)
+            Opcode.APUT_CHAR -> decodeArrayStore(instruction, address, opcode, VortexTypes.CHAR, wide = false)
+            Opcode.APUT_SHORT -> decodeArrayStore(instruction, address, opcode, VortexTypes.SHORT, wide = false)
 
             // ------------------------------------------------------------------ fields
             Opcode.IGET, Opcode.IGET_WIDE, Opcode.IGET_OBJECT, Opcode.IGET_BOOLEAN,
@@ -492,9 +494,10 @@ class DexInstructionDecoder(private val resolver: DexReferenceResolver = DexRefe
         address: Int,
         opcode: Opcode,
         componentType: riad.codes.vortex.ir.VortexType?,
+        wide: Boolean,
     ): HirInstruction {
         val registers = threeRegisters(instruction, opcode)
-        return HirArrayLoad(address, registers.registerA, componentType, registers.registerB, registers.registerC)
+        return HirArrayLoad(address, registers.registerA, componentType, registers.registerB, registers.registerC, wide)
     }
 
     private fun decodeArrayStore(
@@ -502,9 +505,10 @@ class DexInstructionDecoder(private val resolver: DexReferenceResolver = DexRefe
         address: Int,
         opcode: Opcode,
         componentType: riad.codes.vortex.ir.VortexType?,
+        wide: Boolean,
     ): HirInstruction {
         val registers = threeRegisters(instruction, opcode)
-        return HirArrayStore(address, componentType, registers.registerB, registers.registerC, registers.registerA)
+        return HirArrayStore(address, componentType, registers.registerB, registers.registerC, registers.registerA, wide)
     }
 
     private fun decodeInvoke(instruction: Instruction, address: Int, opcode: Opcode, kind: InvokeKind): HirInstruction {

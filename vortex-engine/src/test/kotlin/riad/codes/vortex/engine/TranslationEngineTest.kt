@@ -2,13 +2,17 @@ package riad.codes.vortex.engine
 
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.iface.ClassDef
-import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction10x
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction11n
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction11x
+import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction10x
+import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction21c
+import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction21t
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction22b
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction22c
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction23x
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction35c
+import com.android.tools.smali.dexlib2.immutable.ImmutableExceptionHandler
+import com.android.tools.smali.dexlib2.immutable.ImmutableTryBlock
 import com.android.tools.smali.dexlib2.immutable.reference.ImmutableTypeReference
 import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldHaveSize
@@ -254,6 +258,78 @@ class TranslationEngineTest {
         )
     }
 
+    @Test
+    fun `runs a catch handler whose pc is also a normal branch target`() {
+        val dex = dexFile("shared-handler.dex", sharedHandlerClass())
+        val output = workDir.resolve("shared-handler.jar")
+
+        val report = TranslationEngine().translateBlocking(TranslationRequest(dex, output))
+
+        report.isFullyTranslated shouldBe true
+        report.isVerified shouldBe true
+        report.failedClasses.shouldHaveSize(0)
+
+        withLoader(output) { loader ->
+            val shared = loader.loadClass("shared.Pick")
+            val pick = shared.getMethod("pick", STRING)
+            // Normal path: the number was parsed, and the branch never shared the handler.
+            pick.invoke(null, "7") shouldBe "7"
+            // Fallback path entered through the shared pc by a plain branch.
+            pick.invoke(null, null) shouldBe "fallback"
+            // Exception path: the try must reach the handler pc through the trampoline instead, so
+            // the pending throwable is discarded before the shared block runs.
+            pick.invoke(null, "not-a-number") shouldBe "fallback"
+        }
+    }
+
+    /**
+     * `Lshared/Pick;->pick(String)String` — the layout a Kotlin `?:` with a `catch` fallback compiles:
+     * the catch handler pc (11) is also the target of the opening `if-eqz`, and the handler body
+     * starts with the fallback constant rather than a `move-exception`.
+     */
+    private fun sharedHandlerClass(): ClassDef {
+        val implementation = DexFixtures.implementation(
+            registerCount = 1,
+            instructions = listOf(
+                ImmutableInstruction21t(Opcode.IF_EQZ, 0, 11),
+                ImmutableInstruction35c(
+                    Opcode.INVOKE_STATIC, 1, 0, 0, 0, 0, 0,
+                    DexFixtures.methodRef("Ljava/lang/Integer;", "parseInt", listOf("Ljava/lang/String;"), "I"),
+                ),
+                ImmutableInstruction11x(Opcode.MOVE_RESULT, 0),
+                ImmutableInstruction35c(
+                    Opcode.INVOKE_STATIC, 1, 0, 0, 0, 0, 0,
+                    DexFixtures.methodRef("Ljava/lang/String;", "valueOf", listOf("I"), "Ljava/lang/String;"),
+                ),
+                ImmutableInstruction11x(Opcode.MOVE_RESULT, 0),
+                ImmutableInstruction11x(Opcode.RETURN_OBJECT, 0),
+                ImmutableInstruction21c(Opcode.CONST_STRING, 0, DexFixtures.stringRef("fallback")),
+                ImmutableInstruction11x(Opcode.RETURN_OBJECT, 0),
+            ),
+            tryBlocks = listOf(
+                ImmutableTryBlock(
+                    2,
+                    9,
+                    listOf(
+                        ImmutableExceptionHandler("Ljava/lang/Exception;", 11),
+                    ),
+                ),
+            ),
+        )
+        return DexFixtures.classDef(
+            type = "Lshared/Pick;",
+            methods = listOf(
+                DexFixtures.method(
+                    "Lshared/Pick;",
+                    "pick",
+                    parameters = listOf("Ljava/lang/String;"),
+                    returnType = "Ljava/lang/String;",
+                    implementation = implementation,
+                ),
+            ),
+        )
+    }
+
     /** `La;` — an obfuscated class with a private static method and a public entry point. */
     private fun obfuscatedHolder(): ClassDef {
         val privateStatic = DexFixtures.method(
@@ -365,5 +441,6 @@ class TranslationEngineTest {
 
     private companion object {
         val INT: Class<*> = Int::class.javaPrimitiveType!!
+        val STRING: Class<*> = String::class.java
     }
 }

@@ -191,12 +191,17 @@ class TranslationEngine(
         pluginContext: PluginContext,
         options: TranslationOptions,
     ): List<ClassEmission> = coroutineScope {
+        // The fallback analyzer reduces the array-component view to the historical `Object`-first
+        // reading: on type-agnostic `aget-wide`/`aput-wide` it drops the register-version epoch,
+        // which occasionally produces bytecode ASM's own frame computation cannot merge even though
+        // the DEX is well-formed (see MethodLowering). One such burst costs a per-method retry only.
+        val fallbackAnalyzer = MethodAnalyzer(program, options.analysis.copy(wideEpochFallback = false))
         val permits = Semaphore(options.parallelism.coerceAtLeast(1))
         program.classes
             .map { hirClass ->
                 async(Dispatchers.Default) {
                     permits.withPermit {
-                        emitClass(hirClass, analyzer, emitter, plugins, pluginContext, options)
+                        emitClass(hirClass, analyzer, fallbackAnalyzer, emitter, plugins, pluginContext, options)
                     }
                 }
             }
@@ -206,10 +211,12 @@ class TranslationEngine(
     private fun emitClass(
         hirClass: HirClass,
         analyzer: MethodAnalyzer,
+        fallbackAnalyzer: MethodAnalyzer,
         emitter: AsmClassEmitter,
         plugins: List<VortexPlugin>,
         pluginContext: PluginContext,
         options: TranslationOptions,
+        retryFrameBurst: Boolean = true,
     ): ClassEmission {
         return try {
             val analysed = analyzeClass(hirClass, analyzer)
@@ -236,6 +243,11 @@ class TranslationEngine(
             ClassEmission(emitted, report, null)
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
+            // A failed JVM frame computation at emission is retried once with the reduced
+            // array-component view; the retry rebuilds the class's LIR from the same HIR.
+            if (retryFrameBurst && error is TranslationException && "frame computation burst" in error.message.orEmpty()) {
+                return emitClass(hirClass, fallbackAnalyzer, fallbackAnalyzer, emitter, plugins, pluginContext, options, retryFrameBurst = false)
+            }
             if (error is TranslationException && options.failFast) throw error
             ClassEmission(null, null, ClassFailure(hirClass.type.internalName, error.describe()))
         }
@@ -293,4 +305,6 @@ class TranslationEngine(
 }
 
 /** The message to put in a report, never `null`. */
-internal fun Throwable.describe(): String = message?.takeIf { it.isNotBlank() } ?: this::class.java.simpleName
+internal fun Throwable.describe(): String =
+    (message?.takeIf { it.isNotBlank() } ?: this::class.java.simpleName) +
+        stackTrace.take(5).joinToString(" | ") { "${it.methodName}(${it.fileName}:${it.lineNumber})" }

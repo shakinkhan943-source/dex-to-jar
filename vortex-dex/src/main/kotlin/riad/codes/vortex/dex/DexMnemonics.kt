@@ -80,7 +80,9 @@ object DexMnemonics {
         val operation = if (reversed) BinaryOperation.SUBTRACT else BINARY[head] ?: return null
         val kind = KINDS[parts.getOrNull(1)] ?: return null
         val form = when (parts.size) {
-            2 -> ArithmeticForm.REGISTERS_23X
+            // `rsub-int`/`rsub-long` are the suffixless members of the family, but they are not
+            // register-register: the opcode's only formats are `22s` (`vA = #lit - vB`).
+            2 -> if (reversed) ArithmeticForm.LITERAL_16_22S else ArithmeticForm.REGISTERS_23X
             3 -> when (parts[2]) {
                 "2addr" -> ArithmeticForm.TWO_ADDRESS_12X
                 "lit16" -> ArithmeticForm.LITERAL_16_22S

@@ -87,8 +87,21 @@ object BytecodeVerifier {
         ClassLoader(BytecodeVerifier::class.java.classLoader) {
 
         override fun findClass(name: String): Class<*> {
-            val info = hierarchy.classInfo(name.replace('.', '/')) ?: throw ClassNotFoundException(name)
-            val bytes = stubBytes(info)
+            // Types outside the graph are modelled exactly like the hierarchy models them:
+            // conservatively, with `java/lang/Object` as the supertype. Throwing here would make a
+            // perfectly valid method fail verification just because it touches a library class
+            // (`okio.BufferedSink`, `androidx.compose...`) that neither the tool path nor the DEX
+            // file defines — every known caveat of the old JDK-dependent tools.
+            val internalName = name.replace('.', '/')
+            val info = hierarchy.classInfo(internalName)
+            val bytes = stubBytes(
+                info ?: ClassHierarchy.ClassInfo(
+                    type = ObjectType(internalName),
+                    superType = ObjectType.OBJECT,
+                    interfaces = emptyList(),
+                    accessFlags = Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT,
+                ),
+            )
             return defineClass(null, bytes, 0, bytes.size)
         }
 

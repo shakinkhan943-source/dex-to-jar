@@ -51,7 +51,13 @@ class AsmClassEmitter(
 
     fun emit(lirClass: LirClass): EmittedClass {
         val declaration = lirClass.declaration
-        val writer = DexAwareClassWriter(hierarchy)
+        // DEBUG (temporary): VORTEX_NO_FRAMES skips stack-map computation so the raw bytecode can
+        // be inspected (javap) when frame computation itself reports a defect.
+        val writer = if (System.getenv("VORTEX_NO_FRAMES") != null) {
+            DexAwareClassWriter(hierarchy, org.objectweb.asm.ClassWriter.COMPUTE_MAXS)
+        } else {
+            DexAwareClassWriter(hierarchy)
+        }
         val cv: ClassVisitor = if (options.checkVisitorCalls || options.verifyBytecode) {
             CheckClassAdapter(writer, false)
         } else {
@@ -84,7 +90,13 @@ class AsmClassEmitter(
                     emitStub(cv, declaration, method, "method body was not analysed")
                 }
 
-                analysed.summary.isFullyTranslated -> methodEmitter.emit(cv, analysed, method.annotations)
+                analysed.summary.isFullyTranslated -> {
+                    // TEMP-DIAG (revert): trace per-method emission for the frame-merge regression.
+                    if (System.getProperty("vortex.diag.traceEmit", "") == "1") {
+                        System.err.println("EMIT ${method.reference}")
+                    }
+                    methodEmitter.emit(cv, analysed, method.annotations)
+                }
 
                 else -> {
                     stubbed += method.reference.toString()

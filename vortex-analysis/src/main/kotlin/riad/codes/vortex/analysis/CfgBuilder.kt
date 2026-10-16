@@ -59,11 +59,26 @@ class HirControlFlowGraph(
     val blocks: List<HirBlock>,
     val entry: HirBlock,
     val body: HirMethodBody,
+    /**
+     * Catch-handler entry blocks synthesised between a protected block and a `goto`-only jump into
+     * the real handler, one per shared handler pc. Empty when the method needs no split.
+     */
+    val trampolineBlocks: Set<HirBlock> = emptySet(),
 ) {
     private val byAddress: Map<Int, HirBlock> = blocks.associateBy { it.startAddress }
 
-    /** The try regions of this method, in DEX order. */
-    val tryBlocks: List<HirTryBlock> = body.tryBlocks
+    /** The try regions of this method with handler entries pointing at catch trampolines. */
+    val tryBlocks: List<HirTryBlock> = run {
+        // The trampoline's only successor is the real handler block, so the lookup is exact.
+        val trampolineOf: Map<Int, HirBlock> =
+            trampolineBlocks.associateByTo(HashMap()) { it.successors.first().startAddress }
+        body.tryBlocks.map { tryBlock ->
+            val rewritten = tryBlock.handlers.map { handler ->
+                trampolineOf[handler.handlerAddress]?.let { handler.copy(handlerAddress = it.startAddress) } ?: handler
+            }
+            if (rewritten == tryBlock.handlers) tryBlock else tryBlock.copy(handlers = rewritten)
+        }
+    }
 
     fun blockAt(address: Int): HirBlock? = byAddress[address]
 
@@ -153,40 +168,64 @@ object CfgBuilder {
         }
 
         val byAddress = blocks.associateBy { it.startAddress }
-        linkEdges(blocks, byAddress, body.tryBlocks)
-
+        val edges = linkEdges(blocks, byAddress, body.tryBlocks)
+        val (extended, trampolines) = fixSharedHandlers(blocks, edges)
         blocks.first().role = BlockRole.ENTRY
-        return HirControlFlowGraph(blocks = blocks, entry = blocks.first(), body = body)
+        return HirControlFlowGraph(
+            blocks = extended,
+            entry = blocks.first(),
+            body = body,
+            trampolineBlocks = trampolines,
+        )
     }
 
-    private fun linkEdges(blocks: List<HirBlock>, byAddress: Map<Int, HirBlock>, tryBlocks: List<HirTryBlock>) {
-        fun target(address: Int): HirBlock = byAddress[address]
-            ?: throw TranslationException("branch to $address does not name a basic block")
+    /**
+     * The normal- and exceptional-edge record a graph build produces.
+     *
+     * A *normal* edge is a fall-through, an explicit branch or a switch case; an *exceptional* edge is
+     * the protected range to handler connection. A handler pc with a normal edge can also be entered
+     * by ordinary control flow, which is exactly the layout the JVM forbids for a catch body and is
+     * what [fixSharedHandlers] remedies.
+     */
+    private class EdgeRecord {
+        val normalTargets: LinkedHashSet<HirBlock> = LinkedHashSet()
+        val exceptional: LinkedHashSet<Pair<HirBlock, HirBlock>> = LinkedHashSet()
+    }
 
-        fun link(from: HirBlock, to: HirBlock) {
+    private fun linkEdges(blocks: List<HirBlock>, byAddress: Map<Int, HirBlock>, tryBlocks: List<HirTryBlock>): EdgeRecord {
+        val edges = EdgeRecord()
+
+        fun normalLink(from: HirBlock, to: HirBlock) {
             from.successors += to
             to.predecessors += from
+            edges.normalTargets += to
+        }
+
+        fun exceptionalLink(from: HirBlock, to: HirBlock) {
+            from.successors += to
+            to.predecessors += from
+            edges.exceptional += from to to
         }
 
         blocks.forEachIndexed { index, block ->
             val fallThrough = blocks.getOrNull(index + 1)
             when (val terminator = block.terminator) {
-                is HirGoto -> link(block, target(terminator.target))
+                is HirGoto -> normalLink(block, target(byAddress, terminator.target))
 
                 is HirIfTest -> {
-                    link(block, target(terminator.target))
-                    fallThrough?.let { link(block, it) }
+                    normalLink(block, target(byAddress, terminator.target))
+                    fallThrough?.let { normalLink(block, it) }
                 }
 
                 is HirSwitch -> {
-                    terminator.targets.forEach { link(block, target(it)) }
-                    link(block, target(terminator.defaultTarget))
-                    fallThrough?.let { link(block, it) }
+                    terminator.targets.forEach { normalLink(block, target(byAddress, it)) }
+                    normalLink(block, target(byAddress, terminator.defaultTarget))
+                    fallThrough?.let { normalLink(block, it) }
                 }
 
                 is HirReturn, is HirThrow, is HirUnsupported -> Unit
 
-                else -> fallThrough?.let { link(block, it) }
+                else -> fallThrough?.let { normalLink(block, it) }
             }
         }
 
@@ -198,9 +237,65 @@ object CfgBuilder {
             blocks.forEach { block ->
                 if (block.startAddress >= tryBlock.startAddress && block.startAddress < tryBlock.endAddress) {
                     if (block.protectedBy.none { it === tryBlock }) block.protectedBy += tryBlock
-                    handlers.forEach { link(block, it) }
+                    handlers.forEach { exceptionalLink(block, it) }
                 }
             }
         }
+        return edges
     }
+
+    /**
+     * Splits every handler pc that normal control flow can also reach.
+     *
+     * The JVM exception table must be the *only* way into a catch body: an exception entry arrives
+     * with the pending throwable on the operand stack, so a handler label shared with a branch or
+     * fall-through target cannot frame-merge and ASM's frame computation rejects the code. DEX has no
+     * such rule — a Kotlin `?:`-and-`catch` fallback keeps one pc for both entries — so the graph gets
+     * a `goto`-only catch trampoline: the try tables are rewritten onto the trampoline, normal edges
+     * keep entering the real block, and the same register states still merge conservatively.
+     */
+    private fun fixSharedHandlers(blocks: List<HirBlock>, edges: EdgeRecord): Pair<List<HirBlock>, Set<HirBlock>> {
+        val shared = blocks
+            .filter { it.role == BlockRole.EXCEPTION_HANDLER && it in edges.normalTargets }
+            .sortedBy { it.startAddress }
+        if (shared.isEmpty()) return blocks to emptySet()
+
+        val trampolineByHandler = HashMap<HirBlock, HirBlock>(shared.size)
+        val trampolines = LinkedHashSet<HirBlock>(shared.size)
+        val extended = ArrayList<HirBlock>(blocks.size + shared.size)
+        extended += blocks
+
+        // Trampolines are appended past every real code unit so the emitter places them after the
+        // method body, the same way the reference implementation appends its synthetic labels.
+        val codeEnd = blocks.maxOf { it.endAddressExclusive }
+        shared.forEachIndexed { index, handler ->
+            val startAddress = codeEnd + index
+            val trampoline = HirBlock(blocks.size * 1_000 + index + 1, startAddress).apply {
+                role = BlockRole.EXCEPTION_HANDLER
+                endAddressExclusive = startAddress + 1
+                instructions += HirGoto(address = startAddress, target = handler.startAddress)
+            }
+            trampoline.successors += handler
+            handler.predecessors += trampoline
+            // The real pc keeps normal flow; its catch entries all point at the trampoline.
+            handler.role = BlockRole.NORMAL
+            extended += trampoline
+            trampolines += trampoline
+            trampolineByHandler[handler] = trampoline
+        }
+
+        edges.exceptional.forEach { (from, to) ->
+            val trampoline = trampolineByHandler[to] ?: return@forEach
+            from.successors.remove(to)
+            to.predecessors.remove(from)
+            from.successors += trampoline
+            trampoline.predecessors += from
+        }
+
+        return extended to trampolines
+    }
+
+    private fun target(byAddress: Map<Int, HirBlock>, address: Int): HirBlock = byAddress[address]
+        ?: throw TranslationException("branch to $address does not name a basic block")
 }
+

@@ -1,6 +1,7 @@
 package riad.codes.vortex.analysis
 
 import riad.codes.vortex.ir.ArrayType
+import riad.codes.vortex.ir.HirIfTest
 import riad.codes.vortex.ir.HirInstruction
 import riad.codes.vortex.ir.ObjectType
 import riad.codes.vortex.ir.PrimitiveKind
@@ -138,6 +139,34 @@ class RegisterVersioning(
 
         reportUndefinedReads()
 
+        if (System.getProperty("vortex.debug.versions") != null) {
+            System.err.println("DBG versions:")
+            infos.values.forEach { info ->
+                System.err.println(
+                    "  v${info.ref.register}#${info.ref.version} ${info.storage} ${info.ref.type} def@${info.definitionAddress} useResolved=${info.resolvedFromUse}",
+                )
+            }
+            System.err.println("DBG reads:")
+            reads.toSortedMap().forEach { (address, map) ->
+                System.err.println(
+                    "  @$address " + map.entries.joinToString(", ") { (r, ref) -> "v$r->v${ref.register}#${ref.version}:${ref.type}" },
+                )
+            }
+            System.err.println("DBG defs:")
+            definitions.toSortedMap().forEach { (address, map) ->
+                System.err.println(
+                    "  @$address " + map.entries.joinToString(", ") { (r, ref) -> "v$r->v${ref.register}#${ref.version}:${ref.type}" },
+                )
+            }
+            System.err.println("DBG entry states:")
+            cfg.blocks.sortedBy { it.startAddress }.forEach { block ->
+                val state = inference.entryState(block)
+                System.err.println(
+                    "  block@${block.startAddress} " + (state?.entries?.joinToString(", ") { (r, t) -> "v$r=$t" } ?: "none"),
+                )
+            }
+        }
+
         return MethodVersions(
             definitions = definitions,
             reads = reads,
@@ -171,10 +200,42 @@ class RegisterVersioning(
         val readRegisters = RegisterAccess.reads(instruction, inference.moveResultTargets)
         if (readRegisters.isEmpty()) return
         val map = HashMap<Int, RegisterRef>(readRegisters.size * 2)
+        // An equality `if-*` test over two registers decides its operands *together*: the JVM has
+        // only `if_acmp*` or `if_icmp*` shapes, so a compare whose two reads came out with different
+        // storage classes is not merely unsound — it cannot be emitted at all. Per-register state
+        // lookup optimistically anchors each side independently, which is exactly how a compare can
+        // end up with one operand in a reference epoch and the other in an int epoch. For that
+        // two-register shape, the reads take one joint decision computed for the pair instead.
+        val joint = ifTestJointStorage(instruction, readRegisters, state)
         readRegisters.forEach { register ->
-            map[register] = versionFor(instruction, register, state[register], state)
+            map[register] = versionFor(instruction, register, state[register], state, joint)
         }
         reads[instruction.address] = map
+    }
+
+    /**
+     * The storage class its operand registers share on an equality compare, or `null` when the
+     * instruction is not that shape and each read is decided on its own.
+     *
+     * A decisive reference claim on either side wins (`if_acmp*`); a decisive numeric claim anchors
+     * both sides to int (`if_icmp*`); two null claims mean the compare is a null-identity test; and
+     * purely ambiguous values take the int default that the old per-register path used.
+     */
+    private fun ifTestJointStorage(
+        instruction: HirInstruction,
+        readRegisters: List<Int>,
+        state: RegisterState,
+    ): StorageClass? {
+        if (instruction !is HirIfTest || !instruction.comparison.isEquality) return null
+        if (readRegisters.size != 2) return null
+        val claims = readRegisters.map { state[it] }
+        val decisiveReference = claims.any { it is AbstractType.Reference || it is AbstractType.Array }
+        if (decisiveReference) return StorageClass.REFERENCE
+        val decisivePrimitive = claims.any { it is AbstractType.Primitive }
+        if (decisivePrimitive) return StorageClass.INT
+        val nullClaim = claims.any { it == AbstractType.Null }
+        if (nullClaim) return StorageClass.REFERENCE
+        return StorageClass.INT
     }
 
     private fun recordWrites(instruction: HirInstruction, state: RegisterState) {
@@ -192,15 +253,16 @@ class RegisterVersioning(
         register: Int,
         type: AbstractType?,
         state: RegisterState,
+        forcedStorage: StorageClass? = null,
     ): RegisterRef {
-        val storage = StorageClass.ofAbstract(type) ?: StorageClass.ofType(
+        val storage = forcedStorage ?: (StorageClass.ofAbstract(type) ?: StorageClass.ofType(
             resolveAmbiguous(instruction, register, type, state),
-        )
+        ))
         val resolved = StorageClass.ofAbstract(type) == null
-        val concrete = if (resolved) {
-            concreteType(storage, instruction, register, type, state)
-        } else {
-            concreteTypeOf(type!!)
+        val concrete = when {
+            resolved && forcedStorage != null -> defaultType(storage)
+            resolved -> concreteType(storage, instruction, register, type, state)
+            else -> concreteTypeOf(type!!)
         }
         val key = register to storage
         return identity.getOrPut(key) {
@@ -228,7 +290,7 @@ class RegisterVersioning(
         type: AbstractType?,
         state: RegisterState,
     ): VortexType {
-        RegisterAccess.expectedType(instruction, register, inference)?.let { return it }
+        RegisterAccess.expectedType(instruction, register, inference, state)?.let { return it }
         arrayElementType(instruction, register, state)?.let { return it }
         uses.firstExpectedTypeAfter(register, instruction.address)?.let { return it }
         unresolved += register

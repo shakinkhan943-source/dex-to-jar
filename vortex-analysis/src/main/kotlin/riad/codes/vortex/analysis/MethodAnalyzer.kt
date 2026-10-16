@@ -21,6 +21,12 @@ data class AnalysisOptions(
 
     /** Treat an unbalanced operand stack as a hard failure for the method. */
     val failOnUnbalancedStack: Boolean = false,
+
+    /**
+     * Whether [MethodLowering] may read a type-agnostic `aget-wide`/`aput-wide` element type off
+     * the register version. The engine's frame-burst retry reruns a method with this off.
+     */
+    val wideEpochFallback: Boolean = true,
 )
 
 /**
@@ -95,6 +101,7 @@ class MethodAnalyzer(
             cfg = cfg,
             inference = inference,
             versions = versions,
+            wideEpochFallback = options.wideEpochFallback,
         )
         val blocks = lowering.lower()
 

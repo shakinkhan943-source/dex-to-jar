@@ -40,8 +40,10 @@ class DexReferenceResolver {
 
     fun method(reference: DexMethodReference): MethodReference {
         val methodType = methodType(reference)
+        // Array types own methods in DEX (`clone`, inherited `Object` members), so the owner is
+        // resolved as a plain type instead of being forced into a class shape.
         return MethodReference(
-            owner = objectType(reference.definingClass),
+            owner = type(reference.definingClass),
             name = reference.name,
             parameters = methodType.parameters,
             returnType = methodType.returnType,
@@ -51,7 +53,7 @@ class DexReferenceResolver {
     fun method(reference: DexMethodReference, proto: MethodProtoReference): MethodReference {
         val methodType = methodType(proto)
         return MethodReference(
-            owner = objectType(reference.definingClass),
+            owner = type(reference.definingClass),
             name = reference.name,
             parameters = methodType.parameters,
             returnType = methodType.returnType,

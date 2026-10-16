@@ -270,6 +270,15 @@ sealed interface LirInstruction {
     /** `move-exception`: stores the pending throwable held on the operand stack into a slot. */
     data class CatchException(val dest: RegisterRef) : LirInstruction
 
+    /**
+     * Discards the pending throwable a catch entry pushes, without storing it anywhere.
+     *
+     * DEX may omit `move-exception` when the handler never reads the caught value; the split catch
+     * trampoline relies on this to throw the pending throwable away before jumping into code that
+     * normal control flow also reaches, so the two entries frame-merge with an empty stack.
+     */
+    object DiscardThrowable : LirInstruction
+
     /** A translated `nop`, or padding introduced by the lowering pass. */
     object NoOp : LirInstruction
 

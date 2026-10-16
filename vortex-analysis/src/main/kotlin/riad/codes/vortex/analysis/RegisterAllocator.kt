@@ -8,27 +8,29 @@ import riad.codes.vortex.ir.TranslationException
 data class SlotAllocation(
     val slots: Map<RegisterRef, Int>,
     val locals: Int,
-    /** How many versions were placed into a slot another version had already vacated. */
-    val reusedSlots: Int,
+    /**
+     * Kept for compatibility with earlier layouts: [RegisterAllocator] no longer shares slots
+     * between versions, so this is always 0.
+     */
+    val reusedSlots: Int = 0,
 )
 
 /**
  * Linear-scan allocation of JVM local slots to register versions.
  *
- * Slots are a flat array on the JVM, and a version occupies one slot (two for `long`/`double`). The
- * allocator walks versions in live-range order and gives each one the lowest slot whose existing
- * occupants are either a different point in time or a non-overlapping slice of the array.
+ * Slots are a flat array on the JVM, and a version occupies one slot (two for `long`/`double`).
+ * Allocating a version means giving it a region of that array; parameter versions are pinned first,
+ * because the method signature fixes their slots.
  *
- * Two properties make the reuse sound:
- *
- * * A version is written exactly once, so if version A's range ends before version B's begins, every
- *   path reaching B's range writes B after the last write of A. The frame at B's range therefore
- *   carries B's type on all paths — the JVM's *frames* cover all locals, live or not, so "my value is
- *   dead here" is not enough on its own.
- * * Versions already in flight keep their slots, so a value that is live across a branch never moves.
- *
- * Parameter slots are pinned: the method signature fixes them, and nothing else may be allocated
- * into them.
+ * **No slot is shared between two versions.** Each version's region starts past the last one placed.
+ * Reuse is only sound when a version stands for exactly one write epoch — then a slot whose range
+ * has ended is genuinely dead on every path reaching the next range. The current versioning does not
+ * give that guarantee: its per-(`register`, storage-class) identity model lets one version be written
+ * on several control-flow paths and reused across epochs — under that model, slot sharing
+ * produced methods where a category-2 slot was written as an `int` on one path while another path
+ * loaded it as a `long` — a state whose stack map frames cannot merge, and `COMPUTE_FRAMES` died in
+ * `Frame.merge`. Grow a disjoint layout and let the JVM worry about slots; re-enable reuse only once
+ * a version reliably means one write epoch.
  */
 class RegisterAllocator(
     private val pinned: Map<RegisterRef, Int>,
@@ -56,7 +58,6 @@ class RegisterAllocator(
             placements += Placement(slot, storageOf(ref).width, ranges[ref] ?: WHOLE_METHOD, storageOf(ref), ref)
         }
 
-        var reused = 0
         val pending = ranges.keys
             .filter { it !in pinned }
             .sortedWith(compareBy({ ranges.getValue(it).start }, { it.register }, { it.version }))
@@ -65,29 +66,22 @@ class RegisterAllocator(
             val range = ranges.getValue(ref)
             val width = storageOf(ref).width
             val storage = storageOf(ref)
-            var candidate = reservedSlots
-            while (true) {
-                val conflict = placements.firstOrNull { placement ->
-                    placement.range.overlaps(range) && overlaps(placement.slot, placement.width, candidate, width)
-                } ?: break
-                candidate = conflict.slot + conflict.width
-            }
+            var candidate = placements.maxOfOrNull { it.slot + it.width } ?: reservedSlots
+            // A category-2 region is 2-aligned so that a `long`/`double` never starts in the upper
+            // half of the previous region's slots.
+            if (width == 2 && candidate % 2 != 0) candidate++
             if (candidate >= MAX_LOCALS) {
                 throw TranslationException(
                     "method needs more than $MAX_LOCALS local slots; register versions could not be packed",
                 )
             }
-            if (placements.any { overlaps(it.slot, it.width, candidate, width) }) reused++
             slots[ref] = candidate
             placements += Placement(candidate, width, range, storage, ref)
         }
 
         val locals = placements.maxOfOrNull { it.slot + it.width } ?: reservedSlots
-        return SlotAllocation(slots = slots, locals = maxOf(locals, reservedSlots), reusedSlots = reused)
+        return SlotAllocation(slots = slots, locals = maxOf(locals, reservedSlots), reusedSlots = 0)
     }
-
-    private fun overlaps(firstSlot: Int, firstWidth: Int, secondSlot: Int, secondWidth: Int): Boolean =
-        firstSlot < secondSlot + secondWidth && secondSlot < firstSlot + firstWidth
 
     private companion object {
         const val MAX_LOCALS = 65_535

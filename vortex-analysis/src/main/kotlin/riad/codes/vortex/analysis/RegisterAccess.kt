@@ -1,5 +1,6 @@
 package riad.codes.vortex.analysis
 
+import riad.codes.vortex.ir.ArrayType
 import riad.codes.vortex.ir.HirArrayLength
 import riad.codes.vortex.ir.HirArrayLoad
 import riad.codes.vortex.ir.HirArrayStore
@@ -134,19 +135,33 @@ object RegisterAccess {
      * first use of the value decides. Uses whose expected type depends on other values (a comparison
      * against a register) return `null` and let the default apply.
      */
-    fun expectedType(instruction: HirInstruction, register: Int, method: MethodTypeContext): VortexType? =
+    fun expectedType(
+        instruction: HirInstruction,
+        register: Int,
+        method: MethodTypeContext,
+        state: RegisterState? = null,
+    ): VortexType? =
         when (instruction) {
+            is HirIfTest -> ifTestExpectedType(instruction, register, state)
+
             is HirMove -> when (instruction.kind) {
-                MoveKind.OBJECT -> instruction.let { VortexTypes.OBJECT }
+                MoveKind.OBJECT -> VortexTypes.OBJECT
                 MoveKind.WIDE -> VortexTypes.LONG
                 MoveKind.INT -> VortexTypes.INT
             }
 
-            // Every register of a `filled-new-array` is an element of the array being built, so the
-            // array type states exactly what the register must hold.
-            is HirFilledNewArray -> instruction.componentType
-
-            is HirBinaryOp -> primitiveFor(instruction.kind)
+            is HirBinaryOp -> when {
+                register == instruction.right.registerOrNull && instruction.kind == riad.codes.vortex.ir.NumericKind.LONG &&
+                    (instruction.operation == riad.codes.vortex.ir.BinaryOperation.SHIFT_LEFT ||
+                        instruction.operation == riad.codes.vortex.ir.BinaryOperation.SHIFT_RIGHT ||
+                        instruction.operation == riad.codes.vortex.ir.BinaryOperation.UNSIGNED_SHIFT_RIGHT)
+                // A `long` shift count register carries a one-word `int`: the JVM's `lshl`/`lshr`/
+                // `lushr` pop (long, int), and DEX `shl-long` reads the count as a single word.
+                // Typing it `long` would give the count a two-slot version whose slots a producer
+                // never wrote — reading it later crashed frame computation.
+                -> VortexTypes.INT
+                else -> primitiveFor(instruction.kind)
+            }
             is HirUnaryOp -> primitiveFor(instruction.kind)
             is HirConversion -> if (register == instruction.source) instruction.from else instruction.to
             is HirCompare -> when (instruction.operation) {
@@ -165,7 +180,16 @@ object RegisterAccess {
             }
 
             is HirStaticFieldPut -> instruction.reference.type
-            is HirArrayLoad -> if (register == instruction.array) instruction.componentType ?: VortexTypes.OBJECT else VortexTypes.INT
+            is HirArrayLoad -> when (register) {
+                // The array operand holds the *array* itself, so the expected type is the array type
+                // of the component. Typing it from `componentType ?: OBJECT` (the element type, or a
+                // bare `Object` for the untyped `aget`) once resolved an `int` element constant two
+                // instructions earlier as `Object`, giving a DEX register one version for both the
+                // `int` and the array it later held — and the emitted slots no longer verified.
+                instruction.array ->
+                    instruction.componentType?.let { ArrayType(it, 1) } ?: VortexTypes.OBJECT
+                else -> instruction.componentType ?: VortexTypes.INT
+            }
             is HirArrayStore -> when (register) {
                 instruction.array -> VortexTypes.OBJECT
                 instruction.index -> VortexTypes.INT
@@ -173,6 +197,10 @@ object RegisterAccess {
             }
 
             is HirArrayLength -> VortexTypes.OBJECT
+            // Elements of a `filled-new-array` take the component type: this is what lets an
+            // ambiguous `const/4` feeding such an array resolve at its FIRST use (the array literal
+            // itself) instead of drifting to a later use of the same register.
+            is HirFilledNewArray -> if (instruction.values.contains(register)) instruction.componentType else null
             is HirCheckCast -> instruction.type
             is HirInstanceOf -> instruction.type
             is HirMonitorEnter, is HirMonitorExit -> VortexTypes.OBJECT
@@ -181,6 +209,50 @@ object RegisterAccess {
             is HirSwitch -> VortexTypes.INT
             else -> null
         }
+
+    /**
+     * What an `if-*` compare demands from one of its register operands.
+     *
+     * DEX `if-eq`/`if-neq` double as object-identity and integer-value tests, so the compare alone
+     * does not say which; the other operand does. When the other side is currently inferred as a
+     * reference, this side must be a reference too — reading it through a stale `int` claim (the
+     * same register can be reused for both) is what produced irreconcilable frames in real code.
+     * Without a state to consult, the compare has no opinion and `null` flows on.
+     */
+    private fun ifTestExpectedType(instruction: HirIfTest, register: Int, state: RegisterState?): VortexType? {
+        // A reference is only ever compared by *equality*: the JVM has no ordered comparison for
+        // references, and DEX's ordered `if-*` tests are therefore always numeric. Committing every
+        // ordered test to an `int` read — including `if-lez v` against the synthetic zero literal, —
+        // — which offer no other register to consult — and even when the *other* operand's state is a
+        // stale reference (a version replay can carry an object type into a numeric compare through a
+        // loop) — keeps the register epoch anchored on the compare itself.
+        //
+        // This check MUST come before any early `null` return below: `if-lez v2` has a literal other
+        // operand, and returning `null` used to leave this read ambiguous, which the first-later-use
+        // heuristic could then resolve to the wrong type entirely (a String epoch for a loop counter).
+        if (!instruction.comparison.isEquality) return VortexTypes.INT
+
+        // Equality compares double as object-identity and integer-value tests, so the compare alone
+        // does not say which. A reference (or an outright null claim, matching the merge of two
+        // const-zero epochs) makes this the `if_acmp*` shape and reads both sides as references;
+        // a decisive numeric claim on the other side anchors this read to an int epoch instead —
+        // reading through a stashed type of the wrong storage class (the same register can be reused
+        // for both) is what produced irreconcilable frames in real code. With no state at all — the
+        // first-expected-type heuristic path — or with an ambiguous own value, the int default applies.
+        val otherRegister: Int? = when (register) {
+            instruction.left -> instruction.right.registerOrNull
+            else -> instruction.left
+        }
+        val self = state?.get(register)
+        val other = otherRegister?.let { state?.get(it) }
+        return when {
+            other is AbstractType.Reference || other is AbstractType.Array -> VortexTypes.OBJECT
+            other == AbstractType.Null &&
+                (self is AbstractType.Reference || self is AbstractType.Array || self == AbstractType.Null) -> VortexTypes.OBJECT
+            other is AbstractType.Primitive || state == null || self is AbstractType.Primitive -> VortexTypes.INT
+            else -> null
+        }
+    }
 
     private fun invokeExpectedType(invoke: HirInvoke, register: Int): VortexType? {
         val argumentIndex = invoke.arguments.indexOf(register)

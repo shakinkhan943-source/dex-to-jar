@@ -11,7 +11,7 @@ plugins {
 
 allprojects {
     group = "riad.codes.vortex"
-    version = "0.1.0"
+    version = "0.1.1"
 }
 
 // JitPack serves the modules under `com.github.<user>.<repo>:<module>:<tag>`; the `group`/`version`

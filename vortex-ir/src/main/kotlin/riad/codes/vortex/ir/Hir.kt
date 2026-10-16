@@ -131,6 +131,14 @@ sealed interface HirEncodedValue {
     data class ArrayValue(val values: List<HirEncodedValue>) : HirEncodedValue
     data class AnnotationValue(val annotation: HirAnnotation) : HirEncodedValue
     data class MethodTypeValue(val methodType: MethodType) : HirEncodedValue
+
+    /**
+     * Method, field and method-handle constants inside annotation values have no class-file
+     * encoding; the emitter drops them, exactly like `null`, instead of aborting the dex.
+     */
+    data class MethodValue(val method: MethodReference) : HirEncodedValue
+    data class FieldValue(val field: FieldReference) : HirEncodedValue
+    data class MethodHandleValue(val reference: MethodReference, val kind: Int, val isInterface: Boolean) : HirEncodedValue
 }
 
 data class HirAnnotationElement(val name: String, val value: HirEncodedValue)
@@ -275,6 +283,8 @@ data class HirArrayLoad(
     val componentType: VortexType?,
     val array: Int,
     val index: Int,
+    /** True for the two-slot `aget-wide` form — the only load whose element is a `long`/`double`. */
+    val wide: Boolean = false,
 ) : HirInstruction
 
 data class HirArrayStore(
@@ -283,6 +293,8 @@ data class HirArrayStore(
     val array: Int,
     val index: Int,
     val value: Int,
+    /** True for the two-slot `aput-wide` form — the only store whose element is a `long`/`double`. */
+    val wide: Boolean = false,
 ) : HirInstruction
 
 data class HirArrayLength(override val address: Int, val dest: Int, val array: Int) : HirInstruction
@@ -473,7 +485,7 @@ data class HirProgram(
         val EMPTY = HirProgram(emptyList(), emptyList())
 
         private fun key(reference: MethodReference): String =
-            "${reference.owner.internalName}#${reference.name}${reference.descriptor}"
+            "${reference.jvmOwnerName}#${reference.name}${reference.descriptor}"
 
         /** Merges several per-DEX programs into one, preserving DEX order. */
         fun merge(programs: List<HirProgram>): HirProgram =

@@ -48,6 +48,12 @@ object AnnotationEmitter {
             // The class file format has no way to encode a null annotation value.
             HirEncodedValue.NullValue -> Unit
 
+            // Same for method, field and method-handle constants: ASM's AnnotationVisitor cannot
+            // store them, so they are dropped rather than crashing the emission of the class.
+            is HirEncodedValue.MethodValue -> Unit
+            is HirEncodedValue.FieldValue -> Unit
+            is HirEncodedValue.MethodHandleValue -> Unit
+
             is HirEncodedValue.ArrayValue -> {
                 val arrayVisitor = visitor.visitArray(name) ?: return
                 value.values.forEach { element -> emitValue(arrayVisitor, null, element) }

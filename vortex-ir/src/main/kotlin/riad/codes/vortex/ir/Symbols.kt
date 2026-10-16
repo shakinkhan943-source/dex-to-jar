@@ -2,7 +2,9 @@ package riad.codes.vortex.ir
 
 /** A reference to a method, resolved: owner plus name plus fully described signature. */
 data class MethodReference(
-    val owner: ObjectType,
+    // The owner is a plain `VortexType`, not an `ObjectType`: DEX lets array types own methods
+    // (`clone`, `equals`, ...) and the verifier keeps the receiver's type honest through it.
+    val owner: VortexType,
     val name: String,
     val parameters: List<VortexType>,
     val returnType: VortexType,
@@ -21,7 +23,17 @@ data class MethodReference(
 
     fun withOwner(newOwner: ObjectType): MethodReference = copy(owner = newOwner)
 
-    override fun toString(): String = "${owner.internalName}.$name$descriptor"
+    /**
+     * The owner as the JVM encodes it in the constant pool: the internal name for classes, the
+     * array descriptor for array types (`Array.clone` is invoked on the array itself).
+     */
+    val jvmOwnerName: String
+        get() = when (val type = owner) {
+            is ObjectType -> type.internalName
+            else -> type.descriptor
+        }
+
+    override fun toString(): String = "${jvmOwnerName}.$name$descriptor"
 }
 
 /** A reference to a field: owner, name and type. */

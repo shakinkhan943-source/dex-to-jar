@@ -10,9 +10,10 @@ build/
 *.iml
 out/
 
-# build output that is NOT source (committed wrappers / docs only)
-*.jar
-META-INF/
-src/testFixtures/
+# build outputs only (not source). The wrapper jar and test fixtures are source and are committed.
 # OS noise
 .DS_Store
+
+# ensure the wrapper and test fixtures stay committable (they are source)
+!gradle/wrapper/gradle-wrapper.jar
+!src/testFixtures/

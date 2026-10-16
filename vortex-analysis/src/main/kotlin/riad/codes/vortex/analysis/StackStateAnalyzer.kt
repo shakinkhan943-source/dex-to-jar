@@ -112,6 +112,8 @@ class StackStateAnalyzer(
         is LirInstruction.Throw -> StackEffect(0, 1)
         // A handler entry starts with the throwable on the stack; `astore` consumes it.
         is LirInstruction.CatchException -> StackEffect(netDepth = -1, peakDepth = 0)
+        // A catch trampoline's `pop` consumes it just the same.
+        LirInstruction.DiscardThrowable -> StackEffect(netDepth = -1, peakDepth = 0)
         LirInstruction.NoOp -> StackEffect(0, 0)
         is LirInstruction.Unsupported -> StackEffect(0, 0)
     }

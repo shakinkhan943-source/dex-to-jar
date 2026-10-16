@@ -113,7 +113,13 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
 
         mv.visitLabel(endLabel)
         if (options.emitLocalVariableTable) emitLocalVariables(mv, method, labelSet)
-        mv.visitMaxs(maxOf(method.summary.estimatedMaxStack, 1), maxOf(method.locals, minimumLocals(method)))
+        // Name the method when ASM's own frame computation bursts on its merge invariants, so a
+        // whole-DEX run points at the failing method directly (the engine retries it once).
+        try {
+            mv.visitMaxs(maxOf(method.summary.estimatedMaxStack, 1), maxOf(method.locals, minimumLocals(method)))
+        } catch (t: Throwable) {
+            throw TranslationException("frame computation burst in ${method.reference}: $t", t)
+        }
     }
 
     private fun emitLocalVariables(mv: MethodVisitor, method: LirMethod, labelSet: LabelSet) {
@@ -148,7 +154,16 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
             is LirInstruction.BinaryOp -> {
                 val opcode = binaryOpcode(instruction.operation, instruction.operandType)
                 pushOperand(mv, method, instruction.left)
-                pushOperand(mv, method, instruction.right)
+                if (isWideShift(instruction.operation, instruction.operandType)) {
+                    // The JVM's `lshl`/`lshr`/`lushr` pop (long, int): a DEX `shl-long` shift count
+                    // is emitted as an int on the stack, even when the analysis typed the count
+                    // register (or its constant) as a two-slot `long`. Pushing the count as a long
+                    // leaves one slot too many on the stack and feeds the shift a category-2
+                    // value, which the verifier rejects and frame computation cannot reconcile.
+                    pushShiftOperand(mv, method, instruction.right)
+                } else {
+                    pushOperand(mv, method, instruction.right)
+                }
                 mv.visitInsn(opcode)
                 store(mv, instruction.dest, method.slotOf(instruction.dest))
             }
@@ -197,12 +212,16 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
                 val opcode = invokeOpcode(instruction)
                 instruction.receiver?.let { load(mv, it, method.slotOf(it)) }
                 instruction.arguments.forEach { load(mv, it, method.slotOf(it)) }
+                // An `invoke-interface` is an interface call by definition, even when the owner
+                // is outside this program's hierarchy (e.g. `okio/BufferedSink`), where the
+                // hierarchy lookup cannot answer and would emit `itf=false` — which the
+                // verifier rejects as `INVOKEINTERFACE can't be used with classes`.
                 mv.visitMethodInsn(
                     opcode,
-                    instruction.reference.owner.internalName,
+                    instruction.reference.jvmOwnerName,
                     instruction.reference.name,
                     instruction.reference.descriptor,
-                    instruction.isInterface,
+                    instruction.kind == riad.codes.vortex.ir.InvokeKind.INTERFACE || instruction.isInterface,
                 )
                 val result = instruction.result
                 when {
@@ -216,7 +235,7 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
             }
 
             is LirInstruction.Construct -> {
-                val owner = instruction.reference.owner.internalName
+                val owner = instruction.reference.jvmOwnerName
                 mv.visitTypeInsn(Opcodes.NEW, owner)
                 mv.visitInsn(Opcodes.DUP)
                 instruction.arguments.forEach { load(mv, it, method.slotOf(it)) }
@@ -329,6 +348,9 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
             // A handler entry has the throwable pushed by the JVM; storing it empties the stack.
             is LirInstruction.CatchException -> mv.visitVarInsn(Opcodes.ASTORE, method.slotOf(instruction.dest))
 
+            // A catch trampoline discards the pending throwable: `pop` is the `astore` without the slot.
+            LirInstruction.DiscardThrowable -> mv.visitInsn(Opcodes.POP)
+
             LirInstruction.NoOp -> Unit
 
             // Unsupported instructions never reach the emitter: the class emitter replaces the whole
@@ -347,9 +369,29 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
         val left = instruction.left
         val right = instruction.right
         val leftRef = (left as? LirInstruction.Operand.Register)?.ref
-        val referenceComparison = leftRef?.type?.isReference == true
+        val rightRef = (right as? LirInstruction.Operand.Register)?.ref
+        val leftIsReference = leftRef?.type?.isReference == true
+        val rightIsReference = rightRef?.type?.isReference == true
+        val referenceComparison = leftIsReference || rightIsReference
 
         if (referenceComparison) {
+            // DEX `if-eq`/`if-neq` compare two references by identity — the Kotlin-compiled
+            // `equals()` prologue does exactly that — which maps to the JVM's `if_acmp*` group,
+            // not to a null check. The operand has to be a reference on both sides.
+            if (leftIsReference && rightIsReference) {
+                if (!instruction.comparison.isEquality) {
+                    throw TranslationException(
+                        "references can only be tested for equality in ${method.reference}: $instruction",
+                    )
+                }
+                load(mv, leftRef!!, method.slotOf(leftRef))
+                load(mv, rightRef!!, method.slotOf(rightRef))
+                mv.visitJumpInsn(
+                    if (instruction.comparison == Comparison.EQUAL) Opcodes.IF_ACMPEQ else Opcodes.IF_ACMPNE,
+                    target,
+                )
+                return
+            }
             val nullCheck = right as? LirInstruction.Operand.Literal
             val isZero = nullCheck?.constant?.let { it is Constant.Zero || it == Constant.IntValue(0) } == true
             if (!isZero) {
@@ -370,9 +412,32 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
             return
         }
 
-        pushOperand(mv, method, left)
-        pushOperand(mv, method, right)
+        pushCategory1(mv, method, left)
+        pushCategory1(mv, method, right)
         mv.visitJumpInsn(integerJumpOpcode(instruction.comparison), target)
+    }
+
+    /**
+     * Loads an operand as the category-1 value that a 32-bit `if-icmp*` jump demands.
+     *
+     * DEX `if-*` tests read one 32-bit word. When the analysis typed that register as a two-slot
+     * `long`/`double` — the low word of a `const-wide` pair — the plain load produces a category-2
+     * stack value and the jump would pop a slot that does not exist. Narrowing on the operand
+     * stack (`l2i`/`d2i`) leaves the local layout untouched while giving the jump its shape.
+     */
+    private fun pushCategory1(mv: MethodVisitor, method: LirMethod, operand: LirInstruction.Operand) {
+        when (operand) {
+            is LirInstruction.Operand.Register -> {
+                load(mv, operand.ref, method.slotOf(operand.ref))
+                when ((operand.ref.type as? PrimitiveType)?.numeric) {
+                    NumericKind.LONG -> mv.visitInsn(Opcodes.L2I)
+                    NumericKind.DOUBLE -> mv.visitInsn(Opcodes.D2I)
+                    else -> {}
+                }
+            }
+
+            is LirInstruction.Operand.Literal -> pushConstant(mv, operand.constant, riad.codes.vortex.ir.VortexTypes.INT)
+        }
     }
 
     private fun emitSwitch(
@@ -384,7 +449,9 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
         val default = labelSet.of(instruction.defaultTarget.id)
         val labels = instruction.targets.map { labelSet.of(it.id) }
         val keys = instruction.keys
-        load(mv, instruction.value, method.slotOf(instruction.value))
+        // Switch keys are 32-bit words; the same category-2 narrowing as `if-icmp*` applies when
+        // the key register is the low word of a `const-wide` pair.
+        pushCategory1(mv, method, LirInstruction.Operand.Register(instruction.value))
 
         if (keys.size == labels.size && keys.size > 1 && isConsecutive(keys)) {
             mv.visitTableSwitchInsn(keys.first(), keys.last(), default, *labels.toTypedArray())
@@ -409,35 +476,94 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
         }
     }
 
+    /**
+     * Pushes a wide-shift count as a JVM `int`, from whatever storage the count value lives in.
+     *
+     * A register the analysis typed as `long`/`double` still carries its value as a category-2
+     * value in its slots; converting to `int` on the operand stack (`l2i`/`d2i`) leaves the local
+     * layout untouched while giving `lshl` the shape it requires. An int/float count needs no
+     * conversion — the load alone already produces a category-1 stack value.
+     */
+    private fun pushShiftOperand(mv: MethodVisitor, method: LirMethod, operand: LirInstruction.Operand) {
+        when (operand) {
+            is LirInstruction.Operand.Register -> {
+                load(mv, operand.ref, method.slotOf(operand.ref))
+                when ((operand.ref.type as? PrimitiveType)?.numeric) {
+                    NumericKind.LONG -> mv.visitInsn(Opcodes.L2I)
+                    NumericKind.DOUBLE -> mv.visitInsn(Opcodes.D2I)
+                    NumericKind.FLOAT -> mv.visitInsn(Opcodes.F2I)
+                    else -> {}
+                }
+            }
+
+            is LirInstruction.Operand.Literal -> pushConstant(mv, operand.constant, riad.codes.vortex.ir.VortexTypes.INT)
+        }
+    }
+
+    /** True for the `long`/`double` shifts whose JVM counterpart pops a one-slot shift count. */
+    private fun isWideShift(operation: BinaryOperation, operandType: VortexType): Boolean {
+        if (operation != BinaryOperation.SHIFT_LEFT &&
+            operation != BinaryOperation.SHIFT_RIGHT &&
+            operation != BinaryOperation.UNSIGNED_SHIFT_RIGHT
+        ) {
+            return false
+        }
+        val numeric = (operandType as? PrimitiveType)?.numeric ?: return false
+        return numeric == NumericKind.LONG || numeric == NumericKind.DOUBLE
+    }
+
     private fun pushConstant(mv: MethodVisitor, constant: Constant, expected: VortexType) {
+        // DEX registers are untyped, and a `const/16 vN, 8` can land in a slot the analysis typed
+        // as a `long`/`double` (`l-load` consumers). The JVM stack is not: pushing a one-slot int
+        // before a two-slot LSTORE/DSTORE underflows it, which then breaks frame computation for
+        // the whole class. Whenever the destination is category 2, the constant comes out widened.
+        val expectLong = expected.isLong()
+        val expectDouble = expected.isDouble()
         when (constant) {
             // `const/4 v0, #0`: the analysis decided whether this register holds an `int` or `null`.
             Constant.Zero -> when {
                 expected.isReference -> mv.visitInsn(Opcodes.ACONST_NULL)
                 expected.isFloat() -> mv.visitInsn(Opcodes.FCONST_0)
+                expectLong -> mv.visitInsn(Opcodes.LCONST_0)
+                expectDouble -> mv.visitInsn(Opcodes.DCONST_0)
                 else -> mv.visitInsn(Opcodes.ICONST_0)
             }
 
             // The lowering rewrites raw payloads into a typed constant once the inference has decided
             // what the register holds; these branches only run if that decision was impossible, in
             // which case the register's own type is still the best answer available.
-            is Constant.NarrowBits -> if (expected.isFloat()) {
-                mv.visitLdcInsn(Float.fromBits(constant.bits))
-            } else {
-                pushInt(mv, constant.bits)
+            is Constant.NarrowBits -> when {
+                expected.isFloat() -> mv.visitLdcInsn(Float.fromBits(constant.bits))
+                expectDouble -> mv.visitLdcInsn(Double.fromBits(constant.bits.toLong()))
+                expectLong -> pushLong(mv, constant.bits.toLong())
+                else -> pushInt(mv, constant.bits)
             }
 
-            is Constant.WideBits -> if (expected.isDouble()) {
-                mv.visitLdcInsn(Double.fromBits(constant.bits))
-            } else {
-                mv.visitLdcInsn(constant.bits)
+            is Constant.WideBits -> when {
+                expected.isDouble() -> mv.visitLdcInsn(Double.fromBits(constant.bits))
+                expected.isLong() -> mv.visitLdcInsn(constant.bits)
+                // A category-2 payload landing on a one-slot stack position (32-bit `if-*`, say)
+                // contributes its low word, exactly like the DEX word the pair came from.
+                else -> pushInt(mv, constant.bits.toInt())
             }
 
-            is Constant.IntValue -> pushInt(mv, constant.value)
-            is Constant.LongValue -> when (constant.value) {
-                0L -> mv.visitInsn(Opcodes.LCONST_0)
-                1L -> mv.visitInsn(Opcodes.LCONST_1)
-                else -> mv.visitLdcInsn(constant.value)
+            is Constant.IntValue -> when {
+                expectLong -> pushLong(mv, constant.value.toLong())
+                expectDouble -> mv.visitLdcInsn(constant.value.toDouble())
+                else -> pushInt(mv, constant.value)
+            }
+
+            is Constant.LongValue -> when {
+                expectLong -> when (constant.value) {
+                    0L -> mv.visitInsn(Opcodes.LCONST_0)
+                    1L -> mv.visitInsn(Opcodes.LCONST_1)
+                    else -> mv.visitLdcInsn(constant.value)
+                }
+
+                expectDouble -> mv.visitLdcInsn(constant.value.toDouble())
+                // A category-2 constant landing in a one-slot slot: only its lower 32 bits reach
+                // the JVM value, matching the DEX register the DEX rtl had split the pair into.
+                else -> pushInt(mv, constant.value.toInt())
             }
 
             is Constant.FloatValue -> when (constant.value) {
@@ -459,7 +585,7 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
             is Constant.MethodHandleValue -> mv.visitLdcInsn(
                 org.objectweb.asm.Handle(
                     constant.kind,
-                    constant.reference.owner.internalName,
+                    constant.reference.jvmOwnerName,
                     constant.reference.name,
                     constant.reference.descriptor,
                     constant.isInterface,
@@ -473,6 +599,17 @@ class AsmMethodEmitter(private val options: EmitOptions = EmitOptions()) {
 
     /** True when a constant landing in this register has to be materialised as a `double`. */
     private fun VortexType.isDouble(): Boolean = this is PrimitiveType && kind.numeric == NumericKind.DOUBLE
+
+    /** True when a constant landing in this register has to be materialised as a `long`. */
+    private fun VortexType.isLong(): Boolean = this is PrimitiveType && kind.numeric == NumericKind.LONG
+
+    private fun pushLong(mv: MethodVisitor, value: Long) {
+        when (value) {
+            0L -> mv.visitInsn(Opcodes.LCONST_0)
+            1L -> mv.visitInsn(Opcodes.LCONST_1)
+            else -> mv.visitLdcInsn(value)
+        }
+    }
 
     private fun pushInt(mv: MethodVisitor, value: Int) {
         when (value) {

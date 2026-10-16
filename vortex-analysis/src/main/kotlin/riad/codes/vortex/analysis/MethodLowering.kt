@@ -38,6 +38,7 @@ import riad.codes.vortex.ir.HirStaticFieldGet
 import riad.codes.vortex.ir.HirStaticFieldPut
 import riad.codes.vortex.ir.HirSwitch
 import riad.codes.vortex.ir.HirThrow
+import riad.codes.vortex.ir.ObjectType
 import riad.codes.vortex.ir.HirUnaryOp
 import riad.codes.vortex.ir.HirUnsupported
 import riad.codes.vortex.ir.InvokeKind
@@ -70,6 +71,13 @@ class MethodLowering(
     private val cfg: HirControlFlowGraph,
     private val inference: MethodTypeInference,
     private val versions: MethodVersions,
+    /**
+     * Whether the type-agnostic `aget-wide`/`aput-wide` forms may read the element type off the
+     * register *version* (the epoch's concrete `[J`/`[D` view) when the inference state holds no
+     * array view. Emission retries a method with this off when ASM's frame computation bursts;
+     * see [MethodAnalyzer] for the retry.
+     */
+    private val wideEpochFallback: Boolean = true,
 ) {
     private val lirBlocks: MutableMap<HirBlock, BasicBlock> = LinkedHashMap()
     private val consumedMoveResults = HashSet<Int>()
@@ -97,6 +105,17 @@ class MethodLowering(
         cfg.blocks.forEach { hirBlock ->
             val block = lirBlocks.getValue(hirBlock)
             var state = inference.entryState(hirBlock)
+            // A catch trampoline is entered only by the exception table, with the pending throwable
+            // on the stack: discarding it empties the stack before the goto into the real handler.
+            // A handler body that DEX compiled without a leading `move-exception` never reads the
+            // caught value either, so the pending throwable is discarded at the block entry as well:
+            // in the JVM's stack discipline it would otherwise leak along the block's successors and
+            // frame-merge with code normal control flow reaches with an empty stack.
+            if (hirBlock in cfg.trampolineBlocks ||
+                (hirBlock.isExceptionHandler && hirBlock.instructions.firstOrNull() !is HirMoveException)
+            ) {
+                block.add(LirInstruction.DiscardThrowable)
+            }
             hirBlock.instructions.forEach { instruction ->
                 if (instruction.address !in consumedMoveResults) {
                     lowerInstruction(instruction, state, block)
@@ -213,23 +232,54 @@ class MethodLowering(
                 ),
             )
 
-            is HirArrayLoad -> block.add(
-                LirInstruction.ArrayLoad(
-                    dest = definition(instruction.dest, instruction.address),
-                    componentType = elementType(instruction.componentType, instruction.array, state),
-                    array = read(instruction.array, instruction.address),
-                    index = read(instruction.index, instruction.address),
-                ),
-            )
+            is HirArrayLoad -> {
+                val array = read(instruction.array, instruction.address)
+                block.add(
+                    LirInstruction.ArrayLoad(
+                        dest = definition(instruction.dest, instruction.address),
+                        // A typed `aget-*` opcode decides first, then the inference *state*'s
+                        // array view, then the read version: the state is the forward-flow typing
+                        // the whole rest of the lowering agrees with, and on type-agnostic
+                        // `aget`/`aget-wide` the epoch view can disagree with it mid-method when
+                        // the array register is carried through a loop (e.g. `LongSparseArray.put`,
+                        // where `mKeys: [J` and `mValues: Object[]` interleave). The version is
+                        // only reached when the state genuinely lost the array's shape at a
+                        // merged/loop-carried point (e.g. `FixedSampleSizeRechunker`, whose
+                        // `long[]` state was unknown and would otherwise emit `aaload`).
+                        componentType = instruction.componentType
+                            ?: arrayComponentOf(instruction.array, state)
+                            ?: (instruction.wide
+                                    .takeIf { it && wideEpochFallback }
+                                    ?.let { versionComponentWhenStateLacksArray(instruction.array, array, state, state[instruction.dest]) }
+                                )
+                            ?: elementType(null, instruction.array, state),
+                        array = array,
+                        index = read(instruction.index, instruction.address),
+                    ),
+                )
+            }
 
-            is HirArrayStore -> block.add(
-                LirInstruction.ArrayStore(
-                    componentType = elementType(instruction.componentType, instruction.array, state),
-                    array = read(instruction.array, instruction.address),
-                    index = read(instruction.index, instruction.address),
-                    value = read(instruction.value, instruction.address),
-                ),
-            )
+            is HirArrayStore -> {
+                val array = read(instruction.array, instruction.address)
+                block.add(
+                    LirInstruction.ArrayStore(
+                        // Same priority as the load: the typed `aput-*` opcode first, the
+                        // inference state above the version epoch (both authoritative for
+                        // `aput-wide`'s `lastore` vs `dastore` on `mKeys`-style `long[]`), then
+                        // the object default.
+                        componentType = instruction.componentType
+                            ?: arrayComponentOf(instruction.array, state)
+                            ?: (instruction.wide
+                                    .takeIf { it && wideEpochFallback }
+                                    ?.let { versionComponentWhenStateLacksArray(instruction.array, array, state, state[instruction.value]) }
+                                )
+                            ?: elementType(null, instruction.array, state),
+                        array = array,
+                        index = read(instruction.index, instruction.address),
+                        value = read(instruction.value, instruction.address),
+                    ),
+                )
+            }
 
             is HirArrayLength -> block.add(
                 LirInstruction.ArrayLength(
@@ -360,7 +410,11 @@ class MethodLowering(
                 receiver = receiver,
                 arguments = arguments,
                 result = result,
-                isInterface = program.hierarchy.isInterface(instruction.reference.owner.internalName),
+                // An array owner (e.g. `[Ljava/lang/Object;->clone()`) is never an interface call.
+                isInterface = when (val type = instruction.reference.owner) {
+                    is ObjectType -> program.hierarchy.isInterface(type.internalName)
+                    else -> false
+                },
             ),
         )
     }
@@ -455,6 +509,49 @@ class MethodLowering(
             else -> null
         }
         return derived ?: hint ?: VortexTypes.OBJECT
+    }
+
+    /**
+     * The component type the inference *state* holds for an array register, without any default:
+     * `elementType` falls back to `Object`, so callers that need to keep backing out (to the
+     * register version's concrete type, for instance) must use this unchanged view instead.
+     */
+    private fun arrayComponentOf(arrayRegister: Int, state: RegisterState): VortexType? {
+        val arrayType = state[arrayRegister] as? AbstractType.Array ?: return null
+        return when (val component = arrayType.component) {
+            is AbstractType.Primitive -> PrimitiveType(component.kind)
+            is AbstractType.Reference -> riad.codes.vortex.ir.ObjectType(component.internalName)
+            is AbstractType.Uninitialized -> riad.codes.vortex.ir.ObjectType(component.internalName)
+            is AbstractType.Array -> ArrayType(VortexTypes.OBJECT, component.dimensions)
+            else -> null
+        }
+    }
+
+    /**
+     * The array component from the register version's concrete type, used only where the
+     * inference state holds *no* array view at all (a merged/loop-carried register the analysis
+     * dropped), and only for the `aget-wide`/`aput-wide` forms whose element type the epoch
+     * `long` vs `double` distinction resolves. When the state *does* hold an array view but its
+     * component is ambiguous (e.g. `null`-constants flowing along the array register), the safe
+     * reading is the state-based `Object` default, not the epoch.
+     *
+     * The epoch is further held back when the inference's own story for the *element* contradicts
+     * the wide form: an `aget-wide` whose destination state is a typed narrow primitive is exactly
+     * the mis-typed site where the `[J` epoch of a recycled register is suspect (observed on
+     * `MergingMediaPeriod.<init>` and `TrackSampleTable`), and the historical `Object` reading is
+     * what passed those containers.
+     */
+    private fun versionComponentWhenStateLacksArray(
+        arrayRegister: Int,
+        array: RegisterRef,
+        state: RegisterState,
+        valueState: AbstractType?,
+    ): VortexType? {
+        if (state[arrayRegister] is AbstractType.Array) return null
+        if (valueState is AbstractType.Primitive && !valueState.kind.wide && valueState.kind != riad.codes.vortex.ir.PrimitiveKind.BOOLEAN) {
+            return null
+        }
+        return (array.type as? ArrayType)?.component
     }
 
     private fun definition(register: Int, address: Int): RegisterRef =

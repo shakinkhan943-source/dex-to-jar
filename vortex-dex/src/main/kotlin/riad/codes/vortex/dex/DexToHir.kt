@@ -14,6 +14,8 @@ import com.android.tools.smali.dexlib2.iface.debug.LineNumber
 import com.android.tools.smali.dexlib2.iface.debug.StartLocal
 import com.android.tools.smali.dexlib2.iface.instruction.Instruction
 import com.android.tools.smali.dexlib2.iface.instruction.SwitchPayload
+import com.android.tools.smali.dexlib2.iface.reference.FieldReference as DexFieldReference
+import com.android.tools.smali.dexlib2.iface.reference.MethodReference as DexMethodReference
 import com.android.tools.smali.dexlib2.iface.value.AnnotationEncodedValue
 import com.android.tools.smali.dexlib2.iface.value.ArrayEncodedValue
 import com.android.tools.smali.dexlib2.iface.value.BooleanEncodedValue
@@ -24,7 +26,10 @@ import com.android.tools.smali.dexlib2.iface.value.EncodedValue
 import com.android.tools.smali.dexlib2.iface.value.EnumEncodedValue
 import com.android.tools.smali.dexlib2.iface.value.FloatEncodedValue
 import com.android.tools.smali.dexlib2.iface.value.IntEncodedValue
+import com.android.tools.smali.dexlib2.iface.value.FieldEncodedValue
 import com.android.tools.smali.dexlib2.iface.value.LongEncodedValue
+import com.android.tools.smali.dexlib2.iface.value.MethodEncodedValue
+import com.android.tools.smali.dexlib2.iface.value.MethodHandleEncodedValue
 import com.android.tools.smali.dexlib2.iface.value.MethodTypeEncodedValue
 import com.android.tools.smali.dexlib2.iface.value.NullEncodedValue
 import com.android.tools.smali.dexlib2.iface.value.ShortEncodedValue
@@ -33,11 +38,13 @@ import com.android.tools.smali.dexlib2.iface.value.TypeEncodedValue
 import riad.codes.vortex.ir.AccessFlags
 import riad.codes.vortex.ir.AnnotationVisibility
 import riad.codes.vortex.ir.DexFormatException
+import riad.codes.vortex.ir.FieldReference
 import riad.codes.vortex.ir.HirAnnotation
 import riad.codes.vortex.ir.HirAnnotationElement
 import riad.codes.vortex.ir.HirClass
 import riad.codes.vortex.ir.HirEncodedValue
 import riad.codes.vortex.ir.HirExceptionHandler
+import riad.codes.vortex.ir.MethodReference
 import riad.codes.vortex.ir.HirField
 import riad.codes.vortex.ir.HirInstruction
 import riad.codes.vortex.ir.HirMethod
@@ -315,6 +322,29 @@ class DexToHir(
         is AnnotationEncodedValue ->
             HirEncodedValue.AnnotationValue(convertAnnotation(value, AnnotationVisibility.RUNTIME))
         is MethodTypeEncodedValue -> HirEncodedValue.MethodTypeValue(resolver.methodType(value.value))
+        is MethodEncodedValue -> HirEncodedValue.MethodValue(resolver.method(value.value))
+        is FieldEncodedValue -> HirEncodedValue.FieldValue(resolver.field(value.value))
+        is MethodHandleEncodedValue -> {
+            val handle = value.value
+            val member = handle.memberReference
+            when (member) {
+                is DexMethodReference ->
+                    HirEncodedValue.MethodHandleValue(resolver.method(member), handle.methodHandleType, false)
+                is DexFieldReference -> {
+                    // A field method-handle has no owner method; the decoder reuses the field
+                    // descriptor in place of a return type so the reference still round-trips.
+                    val field = resolver.field(member)
+                    HirEncodedValue.MethodHandleValue(
+                        MethodReference(field.owner, field.name, emptyList(), field.type),
+                        handle.methodHandleType,
+                        false,
+                    )
+                }
+                else -> throw DexFormatException(
+                    "unsupported method-handle member: ${member.javaClass.name}",
+                )
+            }
+        }
         else -> throw DexFormatException("unsupported encoded value type 0x${value.valueType.toString(16)}")
     }
 }
